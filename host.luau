@@ -7,7 +7,7 @@
 --   Home/End   : jump to first/last
 --   Enter / o  : open SSH pane for selected session
 --   n          : provision a new Colab runtime & open SSH
---   e          : provision an ephemeral (--rm) runtime & open SSH
+--   e          : provision an ephemeral runtime & open SSH; stops when its pane closes
 --   x / Backspace : stop selected session
 --   r          : refresh sessions & compute units
 --   c          : copy ~/.ssh/config ProxyCommand snippet
@@ -473,7 +473,7 @@ local function toolbar_view(state: State): Node
 			key = "btn_new_rm",
 			icon = "bolt",
 			keys = { "e" },
-			title = "Provision with --rm (stops runtime on disconnect)",
+			title = "Provision ephemeral runtime (stops when its pane closes)",
 			actions = { click = "new_rm" },
 		}),
 		ui.button("SSH", {

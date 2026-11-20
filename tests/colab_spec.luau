@@ -90,6 +90,14 @@ test("candidate_bins prioritizes TERN_COLAB_BIN, HOME/.local/bin, and plugin_dir
 		end
 	end
 	assert_eq(count, 1, "deduplicates identical candidates")
+
+	local win = colab.candidate_bins(function(key: string): string?
+		if key == "USERPROFILE" then
+			return "C:\\Users\\tester"
+		end
+		return nil
+	end)
+	assert_eq(win[1], "C:\\Users\\tester/.local/bin/colab.exe", "windows exe first")
 end)
 
 test("parse_sessions parses named and orphaned Colab CLI lines", function()
@@ -177,6 +185,22 @@ test("build_ssh_config_entry generates ProxyCommand stanza", function()
 		assert_true(string.find(entry, "--gpu T4", 1, true) ~= nil, "--gpu flag")
 		assert_true(string.find(entry, "--high-mem", 1, true) ~= nil, "--high-mem flag")
 	end
+end)
+
+test("build_new_args builds `colab new` arguments from presets", function()
+	local function args_for(preset_id: string): string
+		local preset = colab.find_preset(preset_id)
+		assert_true(preset ~= nil, preset_id .. " preset exists")
+		if preset == nil then
+			return ""
+		end
+		return table.concat(colab.build_new_args("ml-exp", preset), " ")
+	end
+
+	assert_eq(args_for("cpu"), "new -s ml-exp", "cpu")
+	assert_eq(args_for("cpu-high"), "new -s ml-exp --high-mem", "cpu high-mem")
+	assert_eq(args_for("t4-high"), "new -s ml-exp --gpu T4 --high-mem", "t4 high-mem")
+	assert_eq(args_for("v5e1"), "new -s ml-exp --tpu v5e1", "tpu")
 end)
 
 test("classify_error categorizes auth and ssh key errors", function()

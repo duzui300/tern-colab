@@ -4,12 +4,9 @@ local colab = require("./lib/colab")
 
 local BLOCK_ID = "tern-colab.sessions"
 local glimpse_panes: { [number]: boolean } = {}
+local ephemeral_sessions: { [number]: string } = {}
 
-tern.on("pane_closed", function(ev: PaneEvent, _cx: WindowCx)
-	glimpse_panes[ev.pane] = nil
-end)
-
-type SessionCallback = (sessions: { colab.SessionInfo }?, err_kind: string?, err_detail: string?) -> ()
+type SessionCallback = (sessions: { colab.SessionInfo }?, err_kind: string?, err_detail: string?, cx: WindowCx?) -> ()
 
 local function is_desktop(): boolean
 	return tern.runtime.os ~= "ios"
@@ -24,24 +21,30 @@ local function safe_exists(path: string): boolean
 	return ok and exists == true
 end
 
+local function is_absolute_path(path: string): boolean
+	return string.sub(path, 1, 1) == "/" or string.match(path, "^%a:[/\\]") ~= nil
+end
+
 local function resolve_bin(): string
 	local override = tern.getenv("TERN_COLAB_BIN")
 	if override and override ~= "" then
-		if string.sub(override, 1, 1) ~= "/" or safe_exists(override) then
+		if not is_absolute_path(override) or safe_exists(override) then
 			return override
 		end
 	end
 
+	-- The host half may cache a bare name from its own shell PATH. The window
+	-- process does not share that PATH, so prefer an absolute candidate here.
 	local ok_kv, cached = pcall(tern.kv.get, "resolved_bin")
 	if ok_kv and type(cached) == "string" and cached ~= "" then
-		if string.sub(cached, 1, 1) ~= "/" or safe_exists(cached) then
+		if is_absolute_path(cached) and safe_exists(cached) then
 			return cached
 		end
 	end
 
 	local candidates = colab.candidate_bins(tern.getenv, tern.plugin.dir)
 	for _, candidate in ipairs(candidates) do
-		if string.sub(candidate, 1, 1) == "/" and safe_exists(candidate) then
+		if is_absolute_path(candidate) and safe_exists(candidate) then
 			return candidate
 		end
 	end
@@ -178,20 +181,20 @@ local function close_popup_panel(cx: WindowCx)
 	end
 end
 
-local function open_ssh_pane(cx: WindowCx, cmd: string)
+local function open_ssh_pane(cx: WindowCx, cmd: string): number?
 	local target = find_tiled_anchor(cx, nil)
 	close_popup_panel(cx)
 	if target ~= nil then
 		local created = cx.layout:split(target, "right", { command = cmd })
 		if created ~= nil then
 			cx.layout:focus(created)
-			return
+			return created
 		end
 	end
-	cx.layout:new_tab({ command = cmd })
+	return cx.layout:new_tab({ command = cmd })
 end
 
-local function launch_ssh(cx: WindowCx, opts: colab.SshLaunchOpts, subtitle: string)
+local function launch_ssh(cx: WindowCx, opts: colab.SshLaunchOpts, subtitle: string): number?
 	local bin = resolve_bin()
 	local cmd = colab.build_ssh_command(bin, opts)
 	-- Tern runs pane commands through the login shell. PowerShell needs the call
@@ -199,46 +202,105 @@ local function launch_ssh(cx: WindowCx, opts: colab.SshLaunchOpts, subtitle: str
 	if tern.runtime.os == "windows" then
 		cmd = "& " .. cmd
 	end
-	open_ssh_pane(cx, cmd)
+	local pane = open_ssh_pane(cx, cmd)
+	if pane == nil then
+		cx:toast("error", "Failed to open Colab SSH pane", subtitle)
+		return nil
+	end
 	cx:toast("info", "Opening Colab SSH pane", subtitle)
+	return pane
 end
 
 local function run_colab(
 	subargs: { string },
 	timeout_ms: number,
-	cb: (res: ProcessResult?, err_kind: string?, err_detail: string?) -> ()
+	cb: (res: ProcessResult?, err_kind: string?, err_detail: string?, cx: WindowCx?) -> ()
 )
 	local argv: { string } = { resolve_bin() }
 	for _, arg in ipairs(subargs) do
 		table.insert(argv, arg)
 	end
 	tern.process.run(argv, { timeout_ms = timeout_ms }):next(
-		function(res: ProcessResult?, err: string?, _cx: WindowCx?)
+		function(res: ProcessResult?, err: string?, next_cx: WindowCx?)
 			if err ~= nil then
-				cb(nil, "failed", err)
+				cb(nil, "failed", err, next_cx)
 				return
 			end
 			if res == nil then
-				cb(nil, "failed", "colab returned no result")
+				cb(nil, "failed", "colab returned no result", next_cx)
 				return
 			end
 			if res.status ~= 0 then
 				local kind, detail = colab.classify_error(res.status, res.stderr, res.stdout)
-				cb(nil, kind, detail)
+				cb(nil, kind, detail, next_cx)
 				return
 			end
-			cb(res, nil, nil)
+			cb(res, nil, nil, next_cx)
 		end
 	)
 end
 
-local function fetch_sessions(cb: SessionCallback)
-	run_colab({ "sessions" }, 12000, function(res: ProcessResult?, err_kind: string?, err_detail: string?)
-		if err_kind ~= nil or res == nil then
-			cb(nil, err_kind or "failed", err_detail or "")
+local function stop_ephemeral(cx: WindowCx, session_name: string)
+	run_colab({ "stop", "-s", session_name }, 20000, function(
+		_res: ProcessResult?,
+		err_kind: string?,
+		err_detail: string?,
+		done_cx: WindowCx?
+	)
+		if err_kind == nil then
 			return
 		end
-		cb(colab.parse_sessions(res.stdout), nil, nil)
+		toast_cli_error(done_cx or cx, "Failed to stop ephemeral session " .. session_name, err_kind, err_detail or "")
+	end)
+end
+
+tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
+	glimpse_panes[ev.pane] = nil
+	local session_name = ephemeral_sessions[ev.pane]
+	if session_name == nil then
+		return
+	end
+	ephemeral_sessions[ev.pane] = nil
+	stop_ephemeral(cx, session_name)
+end)
+
+local ephemeral_timer: TimerHandle? = nil
+
+local function schedule_ephemeral_poll()
+	if ephemeral_timer ~= nil then
+		return
+	end
+	ephemeral_timer = tern.timer(2000, function(cx: WindowCx?)
+		ephemeral_timer = nil
+		if next(ephemeral_sessions) == nil then
+			return
+		end
+		if cx ~= nil then
+			for pane, session_name in pairs(ephemeral_sessions) do
+				if cx.session:pane(pane) == nil then
+					ephemeral_sessions[pane] = nil
+					stop_ephemeral(cx, session_name)
+				end
+			end
+		end
+		if next(ephemeral_sessions) ~= nil then
+			schedule_ephemeral_poll()
+		end
+	end)
+end
+
+local function fetch_sessions(cb: SessionCallback)
+	run_colab({ "sessions" }, 12000, function(
+		res: ProcessResult?,
+		err_kind: string?,
+		err_detail: string?,
+		next_cx: WindowCx?
+	)
+		if err_kind ~= nil or res == nil then
+			cb(nil, err_kind or "failed", err_detail or "", next_cx)
+			return
+		end
+		cb(colab.parse_sessions(res.stdout), nil, nil, next_cx)
 	end)
 end
 
@@ -287,7 +349,7 @@ end
 
 local function prompt_and_launch_preset(cx: WindowCx, preset: colab.Preset, ephemeral: boolean)
 	local title = if ephemeral
-		then "Ephemeral Colab SSH (--rm): " .. preset.label
+		then "Ephemeral Colab SSH: " .. preset.label
 		else "Provision Colab SSH: " .. preset.label
 	prompt_safe_name(
 		cx,
@@ -296,14 +358,59 @@ local function prompt_and_launch_preset(cx: WindowCx, preset: colab.Preset, ephe
 		function(): string
 			return generate_session_name(preset.id)
 		end,
-		function(next_cx: WindowCx, session_name: string)
-			launch_ssh(next_cx, {
-				session = session_name,
-				gpu = preset.gpu,
-				tpu = preset.tpu,
-				high_mem = preset.high_mem,
-				rm = ephemeral,
-			}, session_name .. " · " .. preset.label)
+		function(prompt_cx: WindowCx, session_name: string)
+			fetch_sessions(function(
+				sessions: { colab.SessionInfo }?,
+				err_kind: string?,
+				err_detail: string?,
+				fetch_cx: WindowCx?
+			)
+				local active_cx = fetch_cx or prompt_cx
+				if err_kind ~= nil then
+					toast_cli_error(active_cx, "Failed to list Colab sessions", err_kind, err_detail or "")
+					return
+				end
+				local existing: colab.SessionInfo? = nil
+				if sessions ~= nil then
+					for _, s in ipairs(sessions) do
+						if not s.orphaned and s.name == session_name then
+							existing = s
+							break
+						end
+					end
+				end
+				if existing ~= nil then
+					if ephemeral then
+						active_cx:toast(
+							"error",
+							"Ephemeral sessions need a new name",
+							session_name .. " already exists; choose a new name."
+						)
+						return
+					end
+					active_cx:toast("info", "Session exists, attaching", session_name .. " · " .. existing.hardware)
+					launch_ssh(active_cx, { session = session_name }, session_name .. " · " .. existing.hardware)
+					return
+				end
+				active_cx:toast("info", "Provisioning Colab runtime…", session_name .. " · " .. preset.label)
+				run_colab(colab.build_new_args(session_name, preset), 180000, function(
+					_res: ProcessResult?,
+					new_err: string?,
+					detail: string?,
+					done_cx: WindowCx?
+				)
+					local launch_cx = done_cx or active_cx
+					if new_err ~= nil then
+						toast_cli_error(launch_cx, "Failed to provision " .. session_name, new_err, detail or "")
+						return
+					end
+					local pane = launch_ssh(launch_cx, { session = session_name }, session_name .. " · " .. preset.label)
+					if ephemeral and pane ~= nil then
+						ephemeral_sessions[pane] = session_name
+						schedule_ephemeral_poll()
+					end
+				end)
+			end)
 		end
 	)
 end
@@ -333,9 +440,15 @@ local function start_preset_picker(
 end
 
 local function start_connect_flow(cx: WindowCx)
-	fetch_sessions(function(sessions: { colab.SessionInfo }?, err_kind: string?, err_detail: string?)
+	fetch_sessions(function(
+		sessions: { colab.SessionInfo }?,
+		err_kind: string?,
+		err_detail: string?,
+		fetch_cx: WindowCx?
+	)
+		local active_cx = fetch_cx or cx
 		if err_kind == "auth" then
-			toast_cli_error(cx, "Unable to list Colab sessions", "auth", err_detail or "")
+			toast_cli_error(active_cx, "Unable to list Colab sessions", "auth", err_detail or "")
 			return
 		end
 
@@ -364,36 +477,36 @@ local function start_connect_flow(cx: WindowCx)
 			table.insert(items, preset_item)
 		end
 
-		cx:pick({
+		active_cx:pick({
 			title = "Colab SSH: Attach or Provision",
 			items = items,
 		}):next(function(item: PickItem?, _err: string?, next_cx: WindowCx?)
 			if item == nil then
 				return
 			end
-			local active_cx = next_cx or cx
+			local pick_cx = next_cx or active_cx
 			if string.sub(item.id, 1, 8) == "session:" then
 				local raw_name = string.sub(item.id, 9)
 				local safe_name = colab.sanitize_name(raw_name)
 				if safe_name == nil then
-					active_cx:toast("error", "Invalid session name", raw_name)
+					pick_cx:toast("error", "Invalid session name", raw_name)
 					return
 				end
-				launch_ssh(active_cx, { session = safe_name }, safe_name)
+				launch_ssh(pick_cx, { session = safe_name }, safe_name)
 				return
 			end
 
 			local preset_id = string.gsub(item.id, "^preset:", "")
 			local preset = colab.find_preset(preset_id)
 			if preset ~= nil then
-				prompt_and_launch_preset(active_cx, preset, false)
+				prompt_and_launch_preset(pick_cx, preset, false)
 			end
 		end)
 	end)
 end
 
 local function start_ephemeral_flow(cx: WindowCx)
-	start_preset_picker(cx, "Ephemeral Colab SSH (--rm)", "", function(next_cx: WindowCx, preset: colab.Preset)
+	start_preset_picker(cx, "Ephemeral Colab SSH", "", function(next_cx: WindowCx, preset: colab.Preset)
 		prompt_and_launch_preset(next_cx, preset, true)
 	end)
 end
@@ -427,9 +540,15 @@ local function start_ssh_config_flow(cx: WindowCx)
 end
 
 local function stop_session_flow(cx: WindowCx)
-	fetch_sessions(function(sessions: { colab.SessionInfo }?, err_kind: string?, err_detail: string?)
+	fetch_sessions(function(
+		sessions: { colab.SessionInfo }?,
+		err_kind: string?,
+		err_detail: string?,
+		fetch_cx: WindowCx?
+	)
+		local active_cx = fetch_cx or cx
 		if err_kind ~= nil then
-			toast_cli_error(cx, "Failed to list Colab sessions", err_kind, err_detail or "")
+			toast_cli_error(active_cx, "Failed to list Colab sessions", err_kind, err_detail or "")
 			return
 		end
 		local items: { PickItem } = {}
@@ -446,47 +565,59 @@ local function stop_session_flow(cx: WindowCx)
 			end
 		end
 		if #items == 0 then
-			cx:toast("info", "No active named Colab sessions", "Orphaned [?] runtimes must be stopped in Colab web UI.")
+			active_cx:toast("info", "No active named Colab sessions", "Orphaned [?] runtimes must be stopped in Colab web UI.")
 			return
 		end
 
-		cx:pick({
+		active_cx:pick({
 			title = "Stop Colab Session",
 			items = items,
 		}):next(function(item: PickItem?, _err: string?, next_cx: WindowCx?)
 			if item == nil then
 				return
 			end
-			local active_cx = next_cx or cx
+			local pick_cx = next_cx or active_cx
 			local safe_name = colab.sanitize_name(item.id)
 			if safe_name == nil then
-				active_cx:toast("error", "Invalid session name", item.id)
+				pick_cx:toast("error", "Invalid session name", item.id)
 				return
 			end
-			active_cx:toast("info", "Stopping Colab session…", safe_name)
-			run_colab({ "stop", "-s", safe_name }, 20000, function(_res: ProcessResult?, stop_err: string?, detail: string?)
+			pick_cx:toast("info", "Stopping Colab session…", safe_name)
+			run_colab({ "stop", "-s", safe_name }, 20000, function(
+				_res: ProcessResult?,
+				stop_err: string?,
+				detail: string?,
+				done_cx: WindowCx?
+			)
+				local stop_cx = done_cx or pick_cx
 				if stop_err ~= nil then
-					toast_cli_error(active_cx, "Failed to stop " .. safe_name, stop_err, detail or "")
+					toast_cli_error(stop_cx, "Failed to stop " .. safe_name, stop_err, detail or "")
 					return
 				end
-				active_cx:toast("success", "Stopped Colab session", safe_name)
+				stop_cx:toast("success", "Stopped Colab session", safe_name)
 			end)
 		end)
 	end)
 end
 
 local function check_usage_flow(cx: WindowCx)
-	run_colab({ "usage" }, 12000, function(res: ProcessResult?, err_kind: string?, err_detail: string?)
+	run_colab({ "usage" }, 12000, function(
+		res: ProcessResult?,
+		err_kind: string?,
+		err_detail: string?,
+		done_cx: WindowCx?
+	)
+		local active_cx = done_cx or cx
 		if err_kind ~= nil or res == nil then
-			toast_cli_error(cx, "Failed to check Colab usage", err_kind or "failed", err_detail or "")
+			toast_cli_error(active_cx, "Failed to check Colab usage", err_kind or "failed", err_detail or "")
 			return
 		end
 		local usage = colab.parse_usage(res.stdout)
 		if usage == nil then
-			cx:toast("info", "Colab Compute Units", colab.first_line(res.stdout))
+			active_cx:toast("info", "Colab Compute Units", colab.first_line(res.stdout))
 			return
 		end
-		cx:toast(
+		active_cx:toast(
 			"info",
 			"Compute Units: " .. usage.balance,
 			"Rate: " .. usage.rate .. " · Active: " .. usage.assignments
@@ -571,7 +702,7 @@ tern.command({
 
 tern.command({
 	id = "connect-rm",
-	title = "Colab: Ephemeral SSH (--rm)…",
+	title = "Colab: Ephemeral SSH…",
 	icon = "bolt",
 	group = "Colab",
 	available = desktop_available,

@@ -142,6 +142,11 @@ function Colab.candidate_bins(getenv: (string) -> string?, plugin_dir: string?):
 	end
 
 	add(getenv("TERN_COLAB_BIN"))
+	local userprofile = getenv("USERPROFILE")
+	if userprofile and userprofile ~= "" then
+		add(userprofile .. "/.local/bin/colab.exe")
+		add(userprofile .. "/.local/bin/colab")
+	end
 	local home = Colab.resolve_home(getenv, plugin_dir)
 	if home then
 		add(home .. "/.local/bin/colab")
@@ -273,6 +278,21 @@ function Colab.build_ssh_config_entry(bin: string, preset: Preset, session_name:
 		"  ServerAliveInterval 30",
 	}
 	return table.concat(lines, "\n")
+end
+
+function Colab.build_new_args(session_name: string, preset: Preset): { string }
+	local args: { string } = { "new", "-s", session_name }
+	if preset.gpu and preset.gpu ~= "" then
+		table.insert(args, "--gpu")
+		table.insert(args, preset.gpu)
+	elseif preset.tpu and preset.tpu ~= "" then
+		table.insert(args, "--tpu")
+		table.insert(args, preset.tpu)
+	end
+	if preset.high_mem then
+		table.insert(args, "--high-mem")
+	end
+	return args
 end
 
 function Colab.find_preset(id: string?): Preset?
