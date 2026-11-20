@@ -194,6 +194,11 @@ end
 local function launch_ssh(cx: WindowCx, opts: colab.SshLaunchOpts, subtitle: string)
 	local bin = resolve_bin()
 	local cmd = colab.build_ssh_command(bin, opts)
+	-- Tern runs pane commands through the login shell. PowerShell needs the call
+	-- operator before a quoted executable.
+	if tern.runtime.os == "windows" then
+		cmd = "& " .. cmd
+	end
 	open_ssh_pane(cx, cmd)
 	cx:toast("info", "Opening Colab SSH pane", subtitle)
 end
