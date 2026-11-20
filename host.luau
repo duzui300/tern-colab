@@ -445,8 +445,15 @@ local function connect_selected(state: State, cx: BlockCx)
 	cx:open("colab-ssh://connect?session=" .. colab.url_encode(s.name))
 end
 
+local function is_narrow(cx: BlockCx): boolean
+	return cx.cols < 80
+end
+
 local function list_lines(state: State, cx: BlockCx): number
-	local reserved = 7
+	local reserved = 8
+	if is_narrow(cx) then
+		reserved += 2
+	end
 	if state.usage then
 		reserved += 3
 	end
@@ -461,50 +468,64 @@ local function toolbar_view(state: State): Node
 	local can_ssh: boolean | string = if sel and not sel.orphaned then false else "Select a named session"
 	local can_stop: boolean | string = if sel and not sel.orphaned and not state.action_msg then false else "Select a named session"
 
-	return ui.row({
-		ui.button("New & SSH", {
-			key = "btn_new",
-			icon = "plus",
-			variant = "primary",
-			keys = { "n" },
-			actions = { click = "new" },
-		}),
-		ui.button("Ephemeral", {
-			key = "btn_new_rm",
-			icon = "bolt",
-			keys = { "e" },
-			title = "Provision ephemeral runtime (stops when its pane closes)",
-			actions = { click = "new_rm" },
-		}),
-		ui.button("SSH", {
-			key = "btn_ssh",
-			icon = "terminal",
-			keys = { "enter" },
-			disabled = can_ssh,
-			actions = { click = "connect" },
-		}),
-		ui.button("Stop", {
-			key = "btn_stop",
-			icon = "stop",
-			variant = "danger",
-			keys = { "x" },
-			disabled = can_stop,
-			actions = { click = "stop" },
-		}),
-		ui.button("Refresh", {
-			key = "btn_refresh",
-			icon = "repeat",
-			keys = { "r" },
-			busy = state.loading,
-			actions = { click = "refresh" },
-		}),
-		ui.button("SSH Config", {
-			key = "btn_cfg",
-			icon = "copy",
-			variant = "quiet",
-			keys = { "c" },
-			actions = { click = "ssh_config" },
-		}),
+	local provision = ui.button("Provision", {
+		key = "btn_new",
+		icon = "plus",
+		variant = "primary",
+		keys = { "n" },
+		title = "Provision or attach a Colab runtime",
+		actions = { click = "new" },
+	})
+	local attach = ui.button("Attach", {
+		key = "btn_ssh",
+		icon = "terminal",
+		keys = { "enter" },
+		title = "Attach to the selected runtime",
+		disabled = can_ssh,
+		actions = { click = "connect" },
+	})
+	local stop = ui.button("Stop", {
+		key = "btn_stop",
+		icon = "stop",
+		variant = "danger",
+		keys = { "x" },
+		title = "Stop the selected runtime",
+		disabled = can_stop,
+		actions = { click = "stop" },
+	})
+	local ephemeral = ui.button("Ephemeral", {
+		key = "btn_new_rm",
+		icon = "bolt",
+		variant = "quiet",
+		keys = { "e" },
+		title = "Provision a runtime that stops when its pane closes",
+		actions = { click = "new_rm" },
+	})
+	local refresh = ui.button("Refresh", {
+		key = "btn_refresh",
+		icon = "repeat",
+		variant = "quiet",
+		keys = { "r" },
+		title = "Refresh sessions and compute units",
+		busy = state.loading,
+		actions = { click = "refresh" },
+	})
+	local config = ui.button("Config", {
+		key = "btn_cfg",
+		icon = "copy",
+		variant = "quiet",
+		keys = { "c" },
+		title = "Copy a ~/.ssh/config ProxyCommand entry",
+		actions = { click = "ssh_config" },
+	})
+
+	return ui.node("row", { gap = "sm", wrap = true }, {
+		provision,
+		attach,
+		stop,
+		ephemeral,
+		refresh,
+		config,
 	})
 end
 
@@ -538,16 +559,23 @@ local function sessions_list_view(state: State, cx: BlockCx): Node
 	local sessions: { colab.SessionInfo } = state.sessions or {}
 	local items: { Item } = {}
 	for _, s in sessions do
-		local label: { Span | string } = {
-			ui.span(s.name, "strong"),
-			ui.span("  " .. s.endpoint, "mono muted"),
-		}
+		local label: { Span | string } = { ui.span(s.name, "strong") }
 		if s.orphaned then
 			table.insert(label, ui.span("  (untracked)", "warning"))
 		end
+		local detail: { Span | string } = {}
+		if s.variant ~= "DEFAULT" and s.variant ~= "" then
+			table.insert(detail, s.variant)
+			table.insert(detail, " · ")
+		end
+		table.insert(detail, s.shape)
+		if s.endpoint ~= "" then
+			table.insert(detail, " · ")
+			table.insert(detail, ui.span(s.endpoint, "mono muted"))
+		end
 		table.insert(items, {
 			label = label,
-			detail = s.variant .. " · " .. s.shape,
+			detail = detail,
 			value = ui.span(s.hardware, if s.hardware == "CPU" then "muted" else "strong"),
 			icon = colab.hardware_icon(s.hardware, s.variant),
 			tone = if s.orphaned then "warning" elseif s.hardware ~= "CPU" then "info" else "muted",
@@ -567,17 +595,34 @@ local function sessions_list_view(state: State, cx: BlockCx): Node
 	local lp: { [string]: any } = list.p or {}
 	lp.key = "sessions"
 	lp.selected = if sel then LIST_ID .. sel.key else nil
-	lp.empty = { ui.span("No active Colab runtimes. Press ", "muted"), ui.span("n", "key"), ui.span(" to provision & SSH.", "muted") }
+	lp.empty = {
+		ui.span("No active runtimes. ", "muted"),
+		ui.span("n", "key"),
+		ui.span(" to provision, or ", "muted"),
+		ui.span("e", "key"),
+		ui.span(" for an ephemeral one.", "muted"),
+	}
 	lp.max = { lines = list_lines(state, cx) }
 	list.p = lp
-	return list
+
+	local header: { Node } = { ui.text({ ui.span("Sessions", "strong") }) }
+	if state.fetched then
+		table.insert(
+			header,
+			ui.text({ ui.span("· updated " .. tostring(os.date("%H:%M:%S", state.fetched)), "dim") })
+		)
+	end
+	return ui.col({ ui.row(header), list })
 end
 
 local function stats_view(usage: colab.UsageInfo): Node
+	local rate_value = tonumber(string.match(usage.rate, "^[%d%.]+")) or 0
+	local burn_tone = if rate_value > 0 then "info" else "muted"
+	local active_tone = if usage.assignments == "0" or usage.assignments == "?" then "muted" else "info"
 	return ui.stats({
-		{ label = "Compute Units", value = usage.balance, tone = "accent" },
-		{ label = "Burn Rate", value = usage.rate, tone = "info" },
-		{ label = "Active VMs", value = usage.assignments },
+		{ label = "Compute Units", value = usage.balance, tone = "accent", title = "Available compute units" },
+		{ label = "Burn Rate", value = usage.rate, tone = burn_tone, title = "Compute units per hour" },
+		{ label = "Active VMs", value = usage.assignments, tone = active_tone, title = "Running Colab sessions" },
 	})
 end
 
@@ -588,15 +633,17 @@ local function dock_view(state: State): Node
 	elseif state.loading then
 		table.insert(status, ui.span("Syncing with Colab…", "muted"))
 	elseif state.fetched then
-		local count = if state.sessions then #state.sessions else 0
-		table.insert(status, ui.span(tostring(count) .. " active", "strong"))
-		table.insert(status, ui.span("  updated " .. tostring(os.date("%H:%M:%S", state.fetched)), "muted"))
+		table.insert(status, ui.span("Ready", "strong"))
+	end
+	local line: { Node } = {}
+	if #status > 0 then
+		table.insert(line, ui.text(status))
 	end
 	table.insert(
-		status,
-		ui.span("    ↑↓ move  ⏎ ssh  n new  e tmp  x stop  r sync  c cfg  q hide", "dim")
+		line,
+		ui.text({ ui.span("↑↓ move · ⏎ attach · n new · e temp · x stop · r sync · c config · q hide", "dim") })
 	)
-	return ui.col({ ui.text(status) })
+	return ui.col({ ui.row(line) })
 end
 
 local def: BlockDef<State> = {
@@ -637,9 +684,10 @@ local def: BlockDef<State> = {
 
 	title = function(state: State): string?
 		if state.usage then
-			return "Colab (" .. state.usage.balance .. " CU)"
+			return "Colab · " .. state.usage.balance .. " CU"
 		elseif state.sessions then
-			return "Colab (" .. tostring(#state.sessions) .. ")"
+			local count = #state.sessions
+			return "Colab · " .. tostring(count) .. (if count == 1 then " session" else " sessions")
 		end
 		return "Colab Sessions"
 	end,

@@ -2,7 +2,7 @@
 
 ## What this fork is
 
-This is a fork of [dbydd/tern-colab](https://github.com/dbydd/tern-colab) at commit `f9fc0d1`. It carries two local fixes for Windows with google-colab-cli 0.8.0.
+This is a fork of [dbydd/tern-colab](https://github.com/dbydd/tern-colab) at commit `f9fc0d1`. It carries two local fixes for Windows with google-colab-cli 0.8.0, plus a refined panel UI.
 
 1. **PowerShell call operator and executable path.** `launch_ssh` in `window.luau` prepends `&` to the SSH command when `tern.runtime.os` is `"windows"`. Tern runs pane commands through the login shell, which stays PowerShell. PowerShell needs the call operator before a quoted executable, or it exits with `UnexpectedToken`. The window half also treats drive-letter paths as absolute, and `candidate_bins` includes `%USERPROFILE%/.local/bin/colab.exe`, so `tern.process.run` starts the CLI from the window process instead of falling back to bare `colab`. `resolve_bin` also ignores a cached bare `colab` from the host half, because the window process does not share the host half's shell PATH.
 2. **CLI 0.8.0 provisioning.** `colab ssh -s NEW` in interactive mode does not create a session, and `colab new -s NAME` has no duplicate-name check. The fork creates runtimes with `colab new` through `Colab.build_new_args`, checks `colab sessions` before creating, attaches when the name already exists, and implements ephemeral by stopping the runtime when its pane closes. A 2 s poll of `cx.session:pane` enforces the stop because `pane_closed` was not delivered to a plugin linked into the running window.
@@ -29,7 +29,7 @@ The local changes are limited to `lib/colab.luau`, `window.luau`, `host.luau`, a
 
 - `lib/colab.luau` adds `build_new_args` and the Windows `USERPROFILE` candidates. Keep `build_ssh_argv`, `build_ssh_command`, and `build_ssh_config_entry` unchanged.
 - `window.luau` keeps the `&` prefix Windows-only, so POSIX commands stay unchanged. It also treats drive-letter paths as absolute and adds the provisioning and ephemeral flows. Do not move the Windows quoting into `lib/colab.luau` or change the POSIX quoting.
-- `host.luau` differs only in the `e` key comment and the `btn_new_rm` title.
+- `host.luau` carries the panel refinement: the labeled toolbar, the wrapping toolbar row for narrow docks, the Sessions header with the refresh time, the endpoint in each row's detail, toned stat tiles, and the compact dock hint. It still keeps the `e` key comment and the `btn_new_rm` title.
 - `tests/colab_spec.luau` adds a `build_new_args` test alongside the upstream tests.
 
 `plugin.toml` differs from upstream because it carries the fork version. Keep the version bump when you rebase. `README.md` stays upstream; do not edit it.
